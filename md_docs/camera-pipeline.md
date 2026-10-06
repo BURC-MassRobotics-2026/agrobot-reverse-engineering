@@ -1,0 +1,171 @@
+# Camera data to tomato positions: data-flow overview
+
+- source_pdf: `pdf_docs/camera-pipeline.pdf`
+- scope: RealSense input, localization, alignment, timing, and the robot-frame boundary.
+- basis: Supplied `computer_vision.7z` and matching workspace perception source, reviewed 2026-10-03. Repo copy: `nucbox_archive/nucbox_archive/AgrobotV2/perception/`.
+- configuration: `nucbox_archive/nucbox_archive/AgrobotV2/perception/launch/perception.launch.py` defaults. The optional branch is separate and disabled by default.
+- camera_configuration: Reference requests in the archive `AgrobotV2/REPRODUCE.md`. Actual camera configuration remains unverified.
+- verification: Static source inspection. No live camera capture, model inference, simulation, or robot motion.
+- fast_functions: Find produce, with camera input for Identify crops and Check ripeness.
+
+## Semantics
+
+- Edge kinds: `topic` is a ROS topic transfer. `data` is a local data dependency inside one node. `optional` is a data transfer in the optional depth-image branch. `context` is an undirected context link.
+- Solid arrows show data transfer in the main configured path. They do not establish simultaneous capture or synchronous execution.
+- Amber dashed arrows show the optional depth branch. The standard perception launch leaves both depth topic parameters empty.
+- Dotted connectors attach context or an unresolved boundary. They have no execution direction and do not establish a working robot connection.
+- The spatial group contains local operations within tomato_spatial. The optional group contains local operations within tomato_detector.
+- The selection group contains separate ROS nodes and the selected pose. The overview omits model internals and motion planning.
+- K means camera intrinsics: focal lengths and the principal point, in pixels. XYZ means three-dimensional coordinates.
+- TF is the ROS coordinate-transform system. A frame label alone does not transform coordinates.
+- Cloud coordinates use meters. Optical axes point right for X, down for Y, and forward for Z.
+- The pose header assigns the color optical frame. The alignment note states the unverified geometric assumption behind that assignment.
+- A sphere fit estimates a fruit center. A single depth sample estimates a visible surface point. The two outputs are different.
+- Spatial and tracking JSON omit capture time and frame ID. A new pose timestamp does not make an old observation current.
+- Geometric alignment maps depth through sensor calibration. Alignment does not establish capture synchronization.
+- The driver applies depth scale during point-cloud generation. The optional detector branch uses depth values without unit conversion.
+- Camera topics in the cache box use the /camera/camera/ prefix. Both color subscriptions consume the same named topic independently.
+- The optional input box represents local detector data. This branch does not subscribe to /agrobot/detections or feed the spatial/tracker/Qwen path.
+- The robot boundary concerns the archived perception output. Separate helper code does not establish a calibrated live camera-to-robot connection.
+- Amber boxes identify assumptions or gaps. The green pose box identifies an output, not a successful pick.
+
+## Nodes
+
+- `spatial_owner` | kind: group | Estimate tomato positions · tomato_spatial
+- `selection_path` | kind: group | Select a camera-frame target
+- `optional_depth` | kind: group | Optional depth-image branch · inside tomato_detector · off by default
+- `acquisition` | kind: external_system | RealSense acquisition
+  - D456: reported hardware
+  - librealsense + realsense2_camera
+  - Separate camera launch
+  - Depth units → XYZ in meters
+- `color` | kind: topic | Color image
+  - /camera/camera/color/image_raw
+  - Native pixels + capture header
+- `detector` | kind: ros_node | Detect tomatoes
+  - tomato_detector
+  - BGR → RGB · resize and pad
+  - 518 × 518 model canvas
+  - Models → boxes + confidence
+- `detections` | kind: topic | 2D detections
+  - /agrobot/detections · Detection2DArray
+  - Boxes stay in the 518 × 518 canvas.
+  - Original color header survives inference.
+  - No SAM2 masks in this message
+- `camera_cache` | kind: operation | Cache camera data
+  - Group: `spatial_owner`.
+  - /camera/camera/ topics:
+  - depth/color/points · XYZ (m)
+  - color/camera_info · first K
+  - color/image_raw · latest crop
+- `sphere_fit` | kind: operation | Localize and crop
+  - Group: `spatial_owner`.
+  - Project XYZ with color K.
+  - Map to 518 × 518 boxes.
+  - Clip boxes, not SAM2 masks.
+  - Filter near points and fit spheres.
+  - Crop the cached color image.
+- `spatial_json` | kind: topic | Spatial estimates
+  - Group: `spatial_owner`.
+  - /agrobot/tomato_spatial · JSON
+  - Sphere center + radius + detector score
+  - JPEG crop from cached color
+  - No source timestamp or frame ID
+- `tracker` | kind: ros_node | Track positions
+  - Group: `selection_path`.
+  - tomato_tracker
+  - Persistent IDs + smoothed centers
+  - /agrobot/tomato_tracks · JSON
+  - No source timestamp or frame ID
+- `qwen` | kind: ros_node | Select a track
+  - Group: `selection_path`.
+  - qwen_vl
+  - Choose an existing tracked candidate.
+  - Copy its center into a pose.
+  - No coordinate transformation
+- `pick_target` | kind: topic | Camera-frame target
+  - Group: `selection_path`.
+  - /agrobot/pick_target
+  - PoseStamped · stamp = now()
+  - camera_color_optical_frame
+  - Center (m) · identity orientation
+  - X right · Y down · Z forward
+- `robot_boundary` | kind: unresolved_boundary | Robot-frame gap
+  - Needs a calibrated transform.
+  - Rotation + translation at capture time
+  - No camera-to-robot TF in perception
+  - Live calibration / TF unverified
+- `reference_setup` | kind: context | Source-derived setup
+  - Reference setup requests:
+  - align_depth.enable = true
+  - pointcloud.enable = true
+  - 640 × 480 color at 30 frames/s
+  - Runtime profiles / sync unverified
+  - Source review · no hardware run
+- `timing_gap` | kind: context | Timing gap
+  - Node uses latest cloud and color.
+  - No capture-stamp matching
+  - Cloud receipt age > 2 s: warn only
+- `alignment_gap` | kind: context | Alignment assumption
+  - Cloud in color frame: assumed
+  - No frame check or TF conversion
+- `depth_inputs` | kind: optional_input | Box + cached depth
+  - Group: `optional_depth`.
+  - Internal detector boxes
+  - Depth Image + depth CameraInfo
+  - Topics must be configured.
+  - No capture-stamp matching
+- `depth_sample` | kind: optional_operation | Sample and deproject
+  - Group: `optional_depth`.
+  - Undo resize/pad at the box center.
+  - Sample one depth pixel.
+  - Use depth K to calculate XYZ.
+- `depth_output` | kind: optional_topic | Separate 3D output
+  - Group: `optional_depth`.
+  - /agrobot/detections_3d
+  - One surface sample per box
+  - No tracker/Qwen consumer
+- `depth_gaps` | kind: context | Alignment and unit gaps
+  - Group: `optional_depth`.
+  - Reference uses raw-depth topics.
+  - No cross-camera alignment.
+  - No depth-unit conversion.
+  - If input is mm: 1000× scale error.
+
+## Edges
+
+- `acquisition -> color` | topic | Image
+  - The camera driver publishes /camera/camera/color/image_raw.
+- `color -> detector` | topic | Color
+  - The launch file remaps the detector image input to the RealSense color topic.
+- `detector -> detections` | topic | Boxes
+  - The detector publishes boxes and scores with the original color header.
+- `acquisition -> camera_cache` | topic | Camera topics
+  - The spatial node stores the latest point cloud and color image, plus the first color CameraInfo.
+- `camera_cache -> sphere_fit` | data | Camera data
+  - The node projects cached XYZ using color calibration. It clips points to each box and crops the cached color image.
+- `detections -> sphere_fit` | topic | 2D boxes
+  - A detection message triggers spatial processing. The node does not compare capture timestamps.
+- `sphere_fit -> spatial_json` | data | Center
+  - Sphere fitting supplies a center and radius. The node adds confidence and a crop from cached color.
+- `spatial_json -> tracker` | topic | Spatial JSON
+  - The tracker consumes /agrobot/tomato_spatial. The JSON contains no source timestamp or frame ID.
+- `tracker -> qwen` | topic | Tracks
+  - The Qwen node receives tracked centers, crops, and observation counts through /agrobot/tomato_tracks.
+- `qwen -> pick_target` | topic | Pose
+  - The node copies a selected center, assigns camera_color_optical_frame, and stamps the pose with the current time.
+- `pick_target -- robot_boundary` | context | Unresolved handoff
+  - Robot use needs a calibrated camera-to-robot transform. This connector does not assert a working motion connection.
+- `reference_setup -- acquisition` | context | Reference configuration
+  - The archive requests alignment and point-cloud output. Actual driver settings, calibration, and capture synchronization remain unverified.
+- `timing_gap -- camera_cache` | context | Cached data timing
+  - The node combines cached inputs without capture-time matching. Its age warning measures time since cloud receipt and does not reject stale data.
+- `alignment_gap -- sphere_fit` | context | Frame assumption
+  - Projection assumes color-frame XYZ. The node neither checks the cloud frame ID nor transforms the cloud.
+- `depth_inputs -> depth_sample` | optional | Local data
+  - The detector uses internal boxes and its cached depth image and calibration.
+  - Condition: Both depth subscriptions provide data. Both topic parameters are empty by default.
+- `depth_sample -> depth_output` | optional | XYZ
+  - The detector publishes valid samples in Detection3DArray with the original color header. The branch does not fit a fruit center.
+- `depth_gaps -- depth_output` | context | Optional-branch limitations
+  - The reference command supplies raw-depth topics. The function neither aligns depth with color nor converts depth units.

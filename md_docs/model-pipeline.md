@@ -1,0 +1,147 @@
+# Models in the Agrobot vision pipeline: data-flow overview
+
+- source_pdf: `pdf_docs/model-pipeline.pdf`
+- scope: Model roles, detector fallbacks, and downstream target selection.
+- basis: Supplied `computer_vision.7z` and matching workspace perception source, reviewed 2026-10-03. Repo copy: `nucbox_archive/nucbox_archive/AgrobotV2/perception/`.
+- configuration: `nucbox_archive/nucbox_archive/AgrobotV2/perception/launch/perception.launch.py` defaults.
+- verification: Static source inspection. No model inference or hardware operation.
+- fast_functions: Identify crops, Check ripeness, and Find produce.
+
+## Semantics
+
+- Edge kinds: `data` is a local data dependency inside one node. `image` is the shared preprocessed frame that goes to one model wrapper. `topic` is a ROS topic transfer. `fallback` is the detector path that applies when SigLIP is off or a wrapper setup fails. `context` is an undirected context link.
+- Solid arrows show data dependencies or ROS topic transfer. They do not establish simultaneous or synchronous execution.
+- The shared image line carries the same preprocessed frame to three consumers. Each wrapper reconstructs RGB where needed.
+- The amber solid arrow shows the detector fallback. Dotted lines attach context and have no execution direction.
+- Pale blue boxes show model and detector operations. Gray boxes show other inputs, ROS nodes, or context.
+- The green box shows published outputs. It does not establish a successful robot pick.
+- The detector group contains local operations within tomato_detector. The lower row contains separate ROS nodes and their outputs.
+- MLP means multilayer perceptron. Its seven inputs combine identity, shape, and color. Its score does not establish ripeness or picking safety.
+- Suppression removes duplicate boxes. Filtering and detection caps can remove candidates before the MLP.
+- Z is distance along the camera optical axis. Observation count measures track updates, not elapsed seconds.
+- The source context box applies to the whole view. It has no data connection.
+
+## Nodes
+
+- `detector` | kind: group | Detect tomatoes · tomato_detector
+- `localize_select` | kind: group | Localize and select
+- `camera_color` | kind: external_input | Camera color
+  - RealSense Image
+  - BGR image
+- `preprocess` | kind: operation | Prepare image
+  - Group: `detector`.
+  - RGB · 518 × 518
+  - Resize and pad
+  - ImageNet normalize
+- `sam2` | kind: model | SAM2
+  - Group: `detector`.
+  - SAM 2.1 Hiera Small
+  - Propose object masks
+  - Mask + box + quality
+- `dinov2` | kind: model | DINOv2
+  - Group: `detector`.
+  - dinov2_vitb14
+  - Extract patch features
+  - 37 × 37 patches
+  - 768 values per patch
+- `base_score` | kind: operation | Score proposals
+  - Group: `detector`.
+  - Tomato/background
+  - prototype similarity
+  - DINO + mask quality
+  - Filter · suppress · cap
+- `siglip` | kind: model | SigLIP
+  - Group: `detector`.
+  - Compare crops with text
+  - Tomato vs. background
+  - Re-score · suppress · cap
+- `mlp` | kind: model | Scoring MLP
+  - Group: `detector`.
+  - 7 → 32 → 16 → 1
+  - Identity + shape + color
+  - Detection confidence
+  - Threshold · suppress · cap
+- `call_order` | kind: context | Data dependencies only
+  - Group: `detector`.
+  - DINOv2 runs before SAM2.
+- `detections` | kind: topic_output | Publish detections
+  - Group: `detector`.
+  - Final confidence gate
+  - /agrobot/detections
+  - 518 × 518 boxes + scores
+- `spatial` | kind: ros_node | Estimate 3D center
+  - Group: `localize_select`.
+  - tomato_spatial
+  - Fit spheres in the point cloud
+  - Centers + radii + JPEG crops
+  - /agrobot/tomato_spatial
+- `tracker` | kind: ros_node | Track candidates
+  - Group: `localize_select`.
+  - tomato_tracker
+  - Persistent IDs + smoothed XYZ
+  - Crops + observation counts
+  - /agrobot/tomato_tracks
+- `qwen` | kind: ros_node_with_model | Qwen-VL selection
+  - Group: `localize_select`.
+  - qwen_vl · Qwen2.5-VL-3B-Instruct
+  - Crops + distance + radius + policy
+  - Assess readiness or rank candidates
+  - Candidates need ≥ 3 observations by default
+- `selection` | kind: topic_output | Selection outputs
+  - Group: `localize_select`.
+  - /agrobot/pick_target
+  - Existing center · camera_color_optical_frame
+  - /agrobot/vlm_selection
+  - /agrobot/vlm_reasoning (inference only)
+  - Robot motion remains unverified.
+- `camera_geometry` | kind: external_input | Camera geometry input
+  - Point cloud + color calibration
+  - Color image for JPEG crops
+- `qwen_bypass` | kind: context | Qwen selection includes bypasses
+  - Loading/unavailable: choose nearest Z.
+  - Cached verdicts: choose nearest Z.
+  - Missing crops or parse failure can bypass a verdict.
+  - Readiness can be bypassed.
+- `evidence` | kind: context | Source-derived view
+  - perception.launch.py defaults
+  - SigLIP enabled if setup succeeds
+  - Hardware and model loading unverified
+
+## Edges
+
+- `camera_color -> preprocess` | data | Image
+- `preprocess -> sam2` | image | Same image · RGB reconstructed for SAM2, SigLIP and MLP
+  - The base detector reconstructs RGB for SAM2 from the preprocessed image.
+- `preprocess -> dinov2` | data | Normalized image
+  - DINOv2 receives the normalized image.
+- `preprocess -> siglip` | image | Same image
+  - The SigLIP wrapper reconstructs RGB and crops the surviving boxes.
+- `preprocess -> mlp` | image | Same image
+  - The MLP wrapper reconstructs RGB to measure candidate color.
+- `sam2 -> base_score` | data | Masks + quality
+  - Masks, boxes, and predicted mask quality feed proposal scoring.
+- `dinov2 -> base_score` | data | Patch features
+  - Patch features feed mask-weighted similarity against stored prototypes.
+- `base_score -> siglip` | data | Score
+  - Surviving candidates retain masks and raw scores.
+  - Condition: Configuration enables SigLIP and both wrapper setups succeed.
+- `siglip -> mlp` | data | Features
+  - Surviving candidates retain SigLIP similarity, DINO similarity, masks, boxes, and mask quality.
+- `mlp -> detections` | data | Detection confidence
+  - MLP scores reach the final node confidence gate after MLP filtering.
+- `base_score -> detections` | fallback | SigLIP disabled OR SigLIP/MLP setup fails
+  - SAM2 + DINOv2 supply detections without the two wrappers.
+- `call_order -- base_score` | context | Data dependency view
+  - Branches describe data dependencies. DINOv2 executes before SAM2 generation.
+- `detections -> spatial` | topic | 2D boxes
+  - /agrobot/detections supplies boxes, labels, and confidence. Masks remain inside the detector.
+- `camera_geometry -> spatial` | data | Camera data
+  - The spatial node uses a cached point cloud, color calibration, and color image.
+- `spatial -> tracker` | topic | JSON
+  - /agrobot/tomato_spatial supplies centers, sphere dimensions, scores, and crops.
+- `tracker -> qwen` | topic | Tracks
+  - /agrobot/tomato_tracks supplies persistent IDs, smoothed centers, crops, and observation counts.
+- `qwen -> selection` | data | Select
+  - The node publishes an existing track center if it selects a candidate. Generated text requires inference.
+- `qwen_bypass -- qwen` | context | Selection bypasses
+  - The selection node includes inference, cached selection, and fallback paths. Readiness is not a persistent gate.
